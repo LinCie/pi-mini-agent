@@ -16,5 +16,23 @@ A minimal subagent extension for Pi.
 ## Install
 
 ```sh
-pi install npm:@lincie/pi-subagent
+pi install npm:@lincie/pi-mini-agent
 ```
+
+## Usage
+
+```ts
+// read-only investigation
+agent { mode: "read", prompt: "Summarize architecture" }
+// work mode can edit
+agent { mode: "work", prompt: "Refactor X and add tests", cwd: "/path" }
+```
+
+## Requirements
+
+- Node >=20
+- pi-coding-agent
+
+## License
+
+MIT

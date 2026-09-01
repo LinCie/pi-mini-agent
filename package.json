@@ -1,0 +1,33 @@
+{
+  "name": "@lincie/pi-mini-agent",
+  "version": "0.1.0",
+  "description": "Streaming subagent tool for Pi with read/work modes and token/cache usage reporting",
+  "type": "module",
+  "license": "MIT",
+  "author": "Aldio Fernanda",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LinCie/pi-mini-agent.git"
+  },
+  "bugs": {
+    "url": "https://github.com/LinCie/pi-mini-agent/issues"
+  },
+  "homepage": "https://github.com/LinCie/pi-mini-agent#readme",
+  "keywords": ["pi-package", "pi", "pi-coding-agent", "subagent", "agent"],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": ["extensions", "README.md", "LICENSE"],
+  "pi": {
+    "extensions": ["./extensions/agent.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "^0.1.0",
+    "@earendil-works/pi-coding-agent": "^0.1.0",
+    "@earendil-works/pi-tui": "^0.1.0",
+    "typebox": "^0.34.0"
+  }
+}

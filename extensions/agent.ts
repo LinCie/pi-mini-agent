@@ -16,6 +16,9 @@ const MAX_OUTPUT_LINES = 2_000;
 const MAX_LIVE_TEXT_CHARS = 8_000;
 const MAX_TOOL_OUTPUT_CHARS = 4_000;
 const MAX_ACTIVITY = 20;
+const MAX_STDERR_CHARS = 20_000;
+const MAX_BUFFER_CHARS = 1_000_000;
+const MAX_PROMPT_CHARS = 20_000;
 
 interface UsageStats {
   input: number;
@@ -44,13 +47,13 @@ interface AgentDetails {
 
   activity: string[];
 
-  // Current streaming assistant response.
+  // Most recently completed assistant response.
   liveText: string;
 
   // Last completed assistant response.
   finalText: string;
 
-  // Partial output from the currently running tool.
+  // Most recently completed tool output.
   toolOutput?: string;
 
   stopReason?: string;
@@ -156,6 +159,12 @@ function toolResultText(result: any): string {
 }
 
 function addActivity(details: AgentDetails, text: string) {
+  // Avoid duplicate consecutive events when Pi emits both
+  // tool_execution_* and message/tool_result events.
+  if (details.activity[details.activity.length - 1] === text) {
+    return;
+  }
+
   details.activity.push(text);
 
   if (details.activity.length > MAX_ACTIVITY) {
@@ -196,6 +205,9 @@ function formatToolCall(
   }
 }
 
+/**
+ * Full renderer used after execution finishes.
+ */
 function renderDetails(details: AgentDetails, expanded: boolean): string {
   const icon =
     details.status === "done"
@@ -236,7 +248,7 @@ function renderDetails(details: AgentDetails, expanded: boolean): string {
     lines.push(output);
   }
 
-  const assistant = details.liveText || details.finalText;
+  const assistant = details.finalText || details.liveText;
 
   if (assistant) {
     lines.push("");
@@ -249,12 +261,26 @@ function renderDetails(details: AgentDetails, expanded: boolean): string {
     }
   }
 
-  if (!expanded && details.status === "running") {
-    lines.push("");
-    lines.push("(Ctrl+O to expand)");
-  }
-
   return lines.join("\n");
+}
+
+/**
+ * Fixed-height renderer used while the child is running.
+ *
+ * Keeping this at exactly four lines prevents Pi's TUI from
+ * constantly growing/shrinking the tool block and moving the
+ * terminal cursor around.
+ */
+function renderPartialDetails(details: AgentDetails): string {
+  const currentActivity =
+    details.activity[details.activity.length - 1] ?? "waiting for agent";
+
+  return [
+    `⏳ agent ${details.mode} · ${details.status}`,
+    `${details.model} · thinking ${details.thinking}`,
+    formatUsage(details.usage),
+    `→ ${truncateTail(currentActivity, 180)}`,
+  ].join("\n");
 }
 
 export default function (pi: ExtensionAPI) {
@@ -263,7 +289,7 @@ export default function (pi: ExtensionAPI) {
     label: "Agent",
 
     description:
-      "Invoke an isolated Pi subagent. Supports read-only and working modes, streams visible activity, and reports model, thinking effort, tokens, cache usage, and cost.",
+      "Invoke an isolated Pi subagent. Supports read-only and working modes, reports live activity, model, thinking effort, tokens, cache usage, and cost.",
 
     promptSnippet: "Invoke an isolated Pi subagent",
 
@@ -300,12 +326,35 @@ export default function (pi: ExtensionAPI) {
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const cwd = params.cwd ?? ctx.cwd;
 
+      // --- cwd validation ---
+      if (params.cwd !== undefined) {
+        if (typeof params.cwd !== "string" || params.cwd.length === 0) {
+          throw new Error("cwd must be non-empty");
+        }
+
+        if (params.cwd.includes("\0")) {
+          throw new Error("cwd must not contain null bytes");
+        }
+      }
+
+      if (typeof cwd !== "string" || cwd.length === 0) {
+        throw new Error("cwd must be non-empty");
+      }
+
+      if (cwd.includes("\0")) {
+        throw new Error("cwd must not contain null bytes");
+      }
+
+      if (params.prompt.length > MAX_PROMPT_CHARS) {
+        throw new Error(
+          `prompt too long: ${params.prompt.length} > ${MAX_PROMPT_CHARS}`,
+        );
+      }
+
       const parentModel = ctx.model
         ? `${ctx.model.provider}/${ctx.model.id}`
         : "(Pi default)";
 
-      // getThinkingLevel() is authoritative for the current
-      // session; ctx.thinkingLevel is kept as fallback.
       const thinking = pi.getThinkingLevel?.() ?? ctx.thinkingLevel ?? "off";
 
       const details: AgentDetails = {
@@ -332,23 +381,31 @@ export default function (pi: ExtensionAPI) {
         finalText: "",
       };
 
+      /**
+       * Updates are intentionally emitted only for coarse
+       * lifecycle events.
+       *
+       * Do NOT call this on text_delta, streaming bash output,
+       * or every stderr chunk. Those high-frequency redraws
+       * cause the TUI cursor to jump.
+       */
       const emitUpdate = () => {
         onUpdate?.({
           content: [
             {
               type: "text",
               text:
-                details.liveText ||
                 details.finalText ||
+                details.liveText ||
                 "(subagent running...)",
             },
           ],
 
-          // Clone enough state that the renderer always sees
-          // the current snapshot.
           details: {
             ...details,
-            usage: { ...details.usage },
+            usage: {
+              ...details.usage,
+            },
             activity: [...details.activity],
           },
         });
@@ -372,11 +429,11 @@ export default function (pi: ExtensionAPI) {
       const args = [
         "--mode",
         "json",
+
         "-p",
         "--no-session",
 
-        // Prevent this extension from being inherited by the
-        // child Pi process.
+        // Do not inherit the agent extension.
         "--no-extensions",
 
         "--tools",
@@ -386,17 +443,15 @@ export default function (pi: ExtensionAPI) {
         systemPrompt,
       ];
 
-      // Explicitly inherit the current parent's model.
       if (ctx.model) {
         args.push("--model", `${ctx.model.provider}/${ctx.model.id}`);
       }
 
-      // Explicitly inherit current thinking effort.
       if (thinking) {
         args.push("--thinking", thinking);
       }
 
-      // Prevent prompts beginning with "-" from becoming flags.
+      // Stop option parsing before the prompt.
       args.push("--", params.prompt);
 
       let stderr = "";
@@ -410,50 +465,79 @@ export default function (pi: ExtensionAPI) {
         });
 
         details.status = "running";
+
         addActivity(details, "started");
+
         emitUpdate();
 
         child.stdout.setEncoding("utf8");
+
         child.stderr.setEncoding("utf8");
 
         let buffer = "";
 
         const processEvent = (event: any) => {
-          if (!event || typeof event !== "object") {
-            return;
-          }
+          try {
+            if (!event || typeof event !== "object") {
+              return;
+            }
 
-          /*
-           * Streaming assistant output.
-           *
-           * Pi JSON mode emits message_update events with an
-           * assistantMessageEvent containing text_delta,
-           * thinking_delta, toolcall_delta, etc.
-           *
-           * We deliberately expose text_delta but not raw
-           * thinking_delta.
-           */
-          if (event.type === "message_update") {
-            const update = event.assistantMessageEvent;
+            /*
+             * IMPORTANT:
+             *
+             * We intentionally ignore message_update.
+             *
+             * text_delta can arrive many times per second.
+             * Repainting Pi's custom tool component for
+             * every token causes terminal cursor jumping.
+             *
+             * We wait for message_end instead.
+             */
+            if (event.type === "message_update") {
+              return;
+            }
 
-            if (!update) return;
+            /*
+             * Tool start is useful live information and
+             * occurs only once per tool invocation.
+             */
+            if (event.type === "tool_execution_start") {
+              const toolName = event.toolName ?? "tool";
 
-            if (update.type === "text_start") {
-              details.liveText = "";
+              addActivity(details, formatToolCall(toolName, event.args));
+
               emitUpdate();
               return;
             }
 
-            if (
-              update.type === "text_delta" &&
-              typeof update.delta === "string"
-            ) {
-              details.liveText += update.delta;
+            /*
+             * IMPORTANT:
+             *
+             * Ignore partial tool updates. Bash/read/etc.
+             * may generate many of these and cause the
+             * same repaint problem as text_delta.
+             *
+             * Completed output is captured below.
+             */
+            if (event.type === "tool_execution_update") {
+              return;
+            }
 
-              if (details.liveText.length > MAX_LIVE_TEXT_CHARS * 4) {
-                details.liveText = truncateTail(
-                  details.liveText,
-                  MAX_LIVE_TEXT_CHARS * 4,
+            /*
+             * Tool completion is coarse-grained and safe
+             * to repaint.
+             */
+            if (event.type === "tool_execution_end") {
+              const toolName = event.toolName ?? "tool";
+
+              addActivity(details, `${toolName} ${event.isError ? "✗" : "✓"}`);
+
+              const output = toolResultText(event.result);
+
+              if (output) {
+                details.toolOutput = truncateTail(
+                  output,
+                  MAX_TOOL_OUTPUT_CHARS,
                 );
               }
 
@@ -462,121 +546,125 @@ export default function (pi: ExtensionAPI) {
             }
 
             /*
-             * We intentionally do not display
-             * thinking_delta. We expose the configured
-             * thinking effort, not hidden chain-of-thought.
+             * Completed messages.
+             *
+             * This gives us:
+             * - assistant output
+             * - token usage
+             * - cache usage
+             * - cost
+             * - actual model/provider
              */
+            if (event.type === "message_end" && event.message) {
+              const message = event.message;
 
-            return;
-          }
+              if (message.role === "assistant") {
+                const text = assistantText(message);
 
-          /*
-           * Newer Pi event shape: tool execution lifecycle.
-           */
-          if (event.type === "tool_execution_start") {
-            const toolName = event.toolName ?? "tool";
+                if (text) {
+                  details.finalText = text;
 
-            addActivity(details, formatToolCall(toolName, event.args));
-
-            details.toolOutput = undefined;
-            emitUpdate();
-            return;
-          }
-
-          if (event.type === "tool_execution_update") {
-            const output = toolResultText(event.partialResult);
-
-            if (output) {
-              details.toolOutput = truncateTail(output, MAX_TOOL_OUTPUT_CHARS);
-
-              emitUpdate();
-            }
-
-            return;
-          }
-
-          if (event.type === "tool_execution_end") {
-            const toolName = event.toolName ?? "tool";
-
-            addActivity(details, `${toolName} ${event.isError ? "✗" : "✓"}`);
-
-            const output = toolResultText(event.result);
-
-            if (output) {
-              details.toolOutput = truncateTail(output, MAX_TOOL_OUTPUT_CHARS);
-            } else {
-              details.toolOutput = undefined;
-            }
-
-            emitUpdate();
-            return;
-          }
-
-          /*
-           * Completed messages.
-           *
-           * This is also where authoritative provider token
-           * usage is available.
-           */
-          if (event.type === "message_end" && event.message) {
-            const message = event.message;
-
-            if (message.role === "assistant") {
-              const text = assistantText(message);
-
-              if (text) {
-                details.finalText = text;
-                details.liveText = text;
-              }
-
-              details.usage.turns += 1;
-
-              const usage = message.usage;
-
-              if (usage) {
-                details.usage.input += usage.input ?? 0;
-
-                details.usage.output += usage.output ?? 0;
-
-                details.usage.cacheRead += usage.cacheRead ?? 0;
-
-                details.usage.cacheWrite += usage.cacheWrite ?? 0;
-
-                details.usage.cost += usage.cost?.total ?? 0;
+                  details.liveText = text;
+                }
 
                 /*
-                 * Do not sum usage.totalTokens across turns.
-                 * In Pi this represents the latest context
-                 * token count, not a cumulative billing
-                 * counter.
+                 * Compatibility:
+                 *
+                 * If this Pi version does not emit
+                 * tool_execution_start, tool calls can
+                 * still be recovered from assistant
+                 * message content.
                  */
-                details.usage.contextTokens = usage.totalTokens ?? 0;
+                if (Array.isArray(message.content)) {
+                  for (const part of message.content) {
+                    if (part?.type !== "toolCall") {
+                      continue;
+                    }
+
+                    addActivity(
+                      details,
+                      formatToolCall(
+                        part.name ?? "tool",
+                        part.arguments ?? part.args,
+                      ),
+                    );
+                  }
+                }
+
+                details.usage.turns += 1;
+
+                const usage = message.usage;
+
+                if (usage) {
+                  details.usage.input += usage.input ?? 0;
+
+                  details.usage.output += usage.output ?? 0;
+
+                  details.usage.cacheRead += usage.cacheRead ?? 0;
+
+                  details.usage.cacheWrite += usage.cacheWrite ?? 0;
+
+                  details.usage.cost += usage.cost?.total ?? 0;
+
+                  /*
+                   * totalTokens is the current/latest
+                   * context size. Do not add it across
+                   * turns.
+                   */
+                  details.usage.contextTokens = usage.totalTokens ?? 0;
+                }
+
+                if (typeof message.model === "string" && message.model) {
+                  if (
+                    typeof message.provider === "string" &&
+                    message.provider
+                  ) {
+                    details.model = `${message.provider}/${message.model}`;
+                  } else {
+                    details.model = message.model;
+                  }
+                }
+
+                if (message.stopReason) {
+                  details.stopReason = message.stopReason;
+                }
+
+                addActivity(
+                  details,
+                  `assistant turn ${details.usage.turns} finished`,
+                );
               }
 
-              if (typeof message.model === "string" && message.model) {
-                if (typeof message.provider === "string" && message.provider) {
-                  details.model = `${message.provider}/${message.model}`;
-                } else {
-                  details.model = message.model;
+              /*
+               * Compatibility with versions that deliver
+               * tool-result messages through message_end.
+               */
+              if (message.role === "toolResult") {
+                const name = message.toolName ?? "tool";
+
+                const output = contentToText(message.content);
+
+                addActivity(details, `${name} result`);
+
+                if (output) {
+                  details.toolOutput = truncateTail(
+                    output,
+                    MAX_TOOL_OUTPUT_CHARS,
+                  );
                 }
               }
 
-              if (message.stopReason) {
-                details.stopReason = message.stopReason;
-              }
-
-              addActivity(
-                details,
-                `assistant turn ${details.usage.turns} finished`,
-              );
+              emitUpdate();
+              return;
             }
 
             /*
-             * Some Pi versions emit tool-result messages as
-             * message_end rather than only via
-             * tool_execution_end.
+             * Compatibility with Pi's upstream subagent
+             * event shape.
              */
-            if (message.role === "toolResult") {
+            if (event.type === "tool_result_end" && event.message) {
+              const message = event.message;
+
               const name = message.toolName ?? "tool";
 
               const output = contentToText(message.content);
@@ -589,42 +677,25 @@ export default function (pi: ExtensionAPI) {
                   MAX_TOOL_OUTPUT_CHARS,
                 );
               }
+
+              emitUpdate();
+              return;
             }
 
-            emitUpdate();
-            return;
-          }
+            if (event.type === "turn_start") {
+              addActivity(details, "LLM turn started");
 
-          /*
-           * Compatibility with the event shape used by Pi's
-           * upstream subagent extension.
-           */
-          if (event.type === "tool_result_end" && event.message) {
-            const message = event.message;
-
-            const name = message.toolName ?? "tool";
-
-            const output = contentToText(message.content);
-
-            addActivity(details, `${name} result`);
-
-            if (output) {
-              details.toolOutput = truncateTail(output, MAX_TOOL_OUTPUT_CHARS);
+              emitUpdate();
+              return;
             }
 
-            emitUpdate();
-            return;
-          }
+            if (event.type === "agent_settled") {
+              addActivity(details, "agent settled");
 
-          if (event.type === "turn_start") {
-            addActivity(details, "LLM turn started");
-
-            emitUpdate();
-            return;
-          }
-
-          if (event.type === "agent_settled") {
-            addActivity(details, "agent settled");
+              emitUpdate();
+            }
+          } catch (e) {
+            addActivity(details, `event error: ${String(e)}`);
 
             emitUpdate();
           }
@@ -639,14 +710,23 @@ export default function (pi: ExtensionAPI) {
             processEvent(JSON.parse(line));
           } catch {
             /*
-             * JSON mode should emit JSONL. Ignore any
-             * unexpected non-protocol stdout.
+             * Keep diagnostics for final output, but do
+             * not repaint the TUI for malformed lines.
              */
+            stderr += `\n[unparseable stdout] ${line}`;
+
+            if (stderr.length > MAX_STDERR_CHARS) {
+              stderr = truncateTail(stderr, MAX_STDERR_CHARS);
+            }
           }
         };
 
         child.stdout.on("data", (chunk: string) => {
           buffer += chunk;
+
+          if (buffer.length > MAX_BUFFER_CHARS) {
+            buffer = truncateTail(buffer, MAX_BUFFER_CHARS);
+          }
 
           const lines = buffer.split("\n");
 
@@ -657,21 +737,71 @@ export default function (pi: ExtensionAPI) {
           }
         });
 
+        /*
+         * IMPORTANT:
+         *
+         * Capture stderr, but do NOT emitUpdate() here.
+         *
+         * Some processes write stderr continuously, which
+         * otherwise causes the same redraw problem.
+         */
         child.stderr.on("data", (chunk: string) => {
           stderr += chunk;
 
-          /*
-           * stderr can contain useful process-level
-           * diagnostics. Surface the tail while running.
-           */
-          details.toolOutput = truncateTail(stderr, MAX_TOOL_OUTPUT_CHARS);
-
-          emitUpdate();
+          if (stderr.length > MAX_STDERR_CHARS) {
+            stderr = truncateTail(stderr, MAX_STDERR_CHARS);
+          }
         });
 
-        child.on("error", reject);
+        let killTimer: ReturnType<typeof setTimeout> | undefined;
+
+        const abort = () => {
+          aborted = true;
+
+          details.status = "aborted";
+
+          addActivity(details, "abort requested");
+
+          emitUpdate();
+
+          child.kill("SIGTERM");
+
+          killTimer = setTimeout(() => {
+            if (child.exitCode === null) {
+              child.kill("SIGKILL");
+            }
+          }, 5_000);
+
+          (
+            killTimer as unknown as {
+              unref?: () => void;
+            }
+          )?.unref?.();
+        };
+
+        child.on("error", (err) => {
+          if (killTimer) {
+            clearTimeout(killTimer);
+          }
+
+          signal?.removeEventListener("abort", abort);
+
+          details.status = "error";
+
+          addActivity(details, `process error: ${String(err)}`);
+
+          emitUpdate();
+
+          reject(err);
+        });
 
         child.on("close", (code) => {
+          if (killTimer) {
+            clearTimeout(killTimer);
+          }
+
+          signal?.removeEventListener("abort", abort);
+
           if (buffer.trim()) {
             processLine(buffer);
           }
@@ -679,27 +809,12 @@ export default function (pi: ExtensionAPI) {
           resolve(code ?? 1);
         });
 
-        const abort = () => {
-          aborted = true;
-
-          details.status = "aborted";
-          addActivity(details, "abort requested");
-
-          emitUpdate();
-
-          child.kill("SIGTERM");
-
-          setTimeout(() => {
-            if (child.exitCode === null) {
-              child.kill("SIGKILL");
-            }
-          }, 5_000).unref();
-        };
-
         if (signal?.aborted) {
           abort();
         } else {
-          signal?.addEventListener("abort", abort, { once: true });
+          signal?.addEventListener("abort", abort, {
+            once: true,
+          });
         }
       });
 
@@ -707,6 +822,7 @@ export default function (pi: ExtensionAPI) {
 
       if (aborted) {
         details.status = "aborted";
+
         emitUpdate();
 
         throw new Error("Subagent invocation aborted");
@@ -728,9 +844,9 @@ export default function (pi: ExtensionAPI) {
       }
 
       details.status = "done";
-      details.toolOutput = undefined;
 
       addActivity(details, "done");
+
       emitUpdate();
 
       const output = truncateOutput(details.finalText.trim());
@@ -757,20 +873,17 @@ export default function (pi: ExtensionAPI) {
 
         details: {
           ...details,
-          usage: { ...details.usage },
+
+          usage: {
+            ...details.usage,
+          },
+
           activity: [...details.activity],
         },
       };
     },
 
-    /*
-     * This is important.
-     *
-     * onUpdate() updates the partial result while execute() is
-     * running. renderResult() controls how those partial results
-     * are actually shown in Pi's TUI.
-     */
-    renderResult(result, { expanded }, theme, _context) {
+    renderResult(result, { expanded, isPartial }, theme, _context) {
       const details = result.details as AgentDetails | undefined;
 
       if (!details) {
@@ -783,12 +896,43 @@ export default function (pi: ExtensionAPI) {
         );
       }
 
-      const raw = renderDetails(details, expanded);
+      /*
+       * CRITICAL FOR TUI STABILITY:
+       *
+       * While running, always render exactly four lines.
+       *
+       * Tool output, assistant text, and activity history are
+       * deliberately excluded from the partial rendering.
+       * Their varying height would make Pi reposition the
+       * cursor on every update.
+       */
+      if (isPartial) {
+        const raw = renderPartialDetails(details);
+
+        const lines = raw.split("\n");
+
+        const rendered = lines
+          .map((line, index) => {
+            if (index === 0) {
+              return theme.fg("warning", line);
+            }
+
+            if (index === 1 || index === 2) {
+              return theme.fg("muted", line);
+            }
+
+            return theme.fg("accent", line);
+          })
+          .join("\n");
+
+        return new Text(rendered, 0, 0);
+      }
 
       /*
-       * Add some lightweight TUI styling while keeping the
-       * actual live output unchanged.
+       * After completion, render the full information.
        */
+      const raw = renderDetails(details, expanded);
+
       const lines = raw.split("\n");
 
       const rendered = lines
@@ -817,10 +961,6 @@ export default function (pi: ExtensionAPI) {
             return theme.fg("accent", line);
           }
 
-          if (line === "(Ctrl+O to expand)") {
-            return theme.fg("dim", line);
-          }
-
           return line;
         })
         .join("\n");
@@ -838,7 +978,9 @@ export default function (pi: ExtensionAPI) {
       return new Text(
         [
           theme.fg("toolTitle", theme.bold("agent invoke")),
+
           theme.fg("muted", ` [${mode}]`),
+
           `\n${theme.fg("dim", preview)}`,
         ].join(""),
         0,

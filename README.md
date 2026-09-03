@@ -4,9 +4,9 @@ A minimal subagent extension for Pi.
 
 ## Features
 
-- `agent` tool with `read` and `work` modes
+- `agent` tool with `explorer` (medium), `reviewer` (xhigh), and `work` (high) modes
 - isolated child Pi process
-- inherits parent model and thinking effort
+- inherits the parent model with role-specific thinking levels
 - streams assistant and tool activity
 - reports input/output/cache tokens and cost
 - abort propagation
@@ -22,8 +22,10 @@ pi install npm:@lincie/pi-mini-agent
 ## Usage
 
 ```ts
-// read-only investigation
-agent { mode: "read", prompt: "Summarize architecture" }
+// quick read-only discovery
+agent { mode: "explorer", prompt: "Find the authentication flow" }
+// deep read-only review
+agent { mode: "reviewer", prompt: "Review the authentication flow for risks" }
 // work mode can edit
 agent { mode: "work", prompt: "Refactor X and add tests", cwd: "/path" }
 ```

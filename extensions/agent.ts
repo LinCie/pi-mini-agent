@@ -4,12 +4,28 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-const CHILD_TOOLS = {
-  read: "read,grep,find,ls",
-  work: "read,grep,find,ls,write,edit,bash",
+const AGENT_PROFILES = {
+  explorer: {
+    tools: "read,grep,find,ls",
+    thinking: "medium",
+    instruction:
+      "Explore the codebase and gather relevant facts. Do not modify files.",
+  },
+  reviewer: {
+    tools: "read,grep,find,ls",
+    thinking: "xhigh",
+    instruction:
+      "Review the requested code or change for correctness, risks, and missing tests. Do not modify files.",
+  },
+  work: {
+    tools: "read,grep,find,ls,write,edit,bash",
+    thinking: "medium",
+    instruction:
+      "Implement the requested changes, run relevant checks, and report what changed.",
+  },
 } as const;
 
-type AgentMode = keyof typeof CHILD_TOOLS;
+type AgentMode = keyof typeof AGENT_PROFILES;
 
 const MAX_OUTPUT_CHARS = 50_000;
 const MAX_OUTPUT_LINES = 2_000;
@@ -292,13 +308,13 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Run a subagent",
 
     promptGuidelines: [
-      "Use mode='read' for inspection and analysis; use mode='work' for edits or commands.",
-      "The child inherits the current model and thinking level.",
+      "Use explorer for codebase discovery, reviewer for deep read-only review, and work for edits.",
+      "The child inherits the parent model; explorer uses medium, reviewer xhigh, and work high thinking.",
       "Verify important subagent conclusions.",
     ],
 
     parameters: Type.Object({
-      mode: StringEnum(["read", "work"] as const),
+      mode: StringEnum(["explorer", "reviewer", "work"] as const),
       prompt: Type.String(),
       cwd: Type.Optional(Type.String()),
     }),
@@ -335,7 +351,8 @@ export default function (pi: ExtensionAPI) {
         ? `${ctx.model.provider}/${ctx.model.id}`
         : "(Pi default)";
 
-      const thinking = pi.getThinkingLevel?.() ?? ctx.thinkingLevel ?? "off";
+      const profile = AGENT_PROFILES[params.mode];
+      const thinking = profile.thinking;
 
       const details: AgentDetails = {
         mode: params.mode,
@@ -396,9 +413,7 @@ export default function (pi: ExtensionAPI) {
         "You are a delegated subagent.",
         "Complete only the assigned task.",
 
-        params.mode === "read"
-          ? "You are read-only. Inspect and analyze, but do not modify files."
-          : "You may modify files and run commands when required by the task.",
+        profile.instruction,
 
         "Be concise.",
         "Report relevant file paths, commands, evidence, and final conclusions.",
@@ -416,7 +431,7 @@ export default function (pi: ExtensionAPI) {
         "--no-extensions",
 
         "--tools",
-        CHILD_TOOLS[params.mode],
+        profile.tools,
 
         "--append-system-prompt",
         systemPrompt,
@@ -948,7 +963,7 @@ export default function (pi: ExtensionAPI) {
     },
 
     renderCall(args, theme, _context) {
-      const mode = args.mode ?? "read";
+      const mode = args.mode ?? "explorer";
 
       const prompt = args.prompt ?? "...";
 

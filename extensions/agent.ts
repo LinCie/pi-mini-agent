@@ -34,7 +34,6 @@ interface UsageStats {
 }
 
 interface AgentDetails {
-  action: "invoke";
   mode: AgentMode;
 
   status: "starting" | "running" | "done" | "error" | "aborted";
@@ -288,39 +287,20 @@ export default function (pi: ExtensionAPI) {
     name: "agent",
     label: "Agent",
 
-    description:
-      "Invoke an isolated Pi subagent. Supports read-only and working modes, reports live activity, model, thinking effort, tokens, cache usage, and cost.",
+    description: "Run an isolated Pi subagent.",
 
-    promptSnippet: "Invoke an isolated Pi subagent",
+    promptSnippet: "Run a subagent",
 
     promptGuidelines: [
-      "Use mode='read' for investigation, research, review, and analysis.",
-      "Use mode='work' when the delegated task should edit files or execute commands.",
-      "The child inherits the current Pi model and thinking level.",
-      "Do not delegate trivial work.",
-      "Verify important subagent conclusions before acting on them.",
+      "Use mode='read' for inspection and analysis; use mode='work' for edits or commands.",
+      "The child inherits the current model and thinking level.",
+      "Verify important subagent conclusions.",
     ],
 
     parameters: Type.Object({
-      action: StringEnum(["invoke"] as const, {
-        description: "Agent operation. Currently only 'invoke'.",
-      }),
-
-      mode: StringEnum(["read", "work"] as const, {
-        description:
-          "'read' can only inspect files. 'work' may edit files and execute bash commands.",
-      }),
-
-      prompt: Type.String({
-        description: "Complete task or question for the subagent.",
-      }),
-
-      cwd: Type.Optional(
-        Type.String({
-          description:
-            "Working directory for the child. Defaults to the parent's cwd.",
-        }),
-      ),
+      mode: StringEnum(["read", "work"] as const),
+      prompt: Type.String(),
+      cwd: Type.Optional(Type.String()),
     }),
 
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
@@ -358,7 +338,6 @@ export default function (pi: ExtensionAPI) {
       const thinking = pi.getThinkingLevel?.() ?? ctx.thinkingLevel ?? "off";
 
       const details: AgentDetails = {
-        action: "invoke",
         mode: params.mode,
         status: "starting",
 

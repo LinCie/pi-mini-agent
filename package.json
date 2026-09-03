@@ -1,5 +1,5 @@
 {
-  "name": "@lincie/pi-mini-agent",
+  "name": "@lincieme/pi-mini-agent",
   "version": "0.1.0",
   "description": "Streaming subagent tool for Pi with read/work modes and token/cache usage reporting",
   "type": "module",
